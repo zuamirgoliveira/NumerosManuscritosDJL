@@ -26,3 +26,6 @@ replay_pid*
 # Dataset gerado por PrepareTrainingImages (70.000 PNGs)
 images-training/
 images-validation/
+
+# Saída do Maven (gerada a cada build)
+target/
