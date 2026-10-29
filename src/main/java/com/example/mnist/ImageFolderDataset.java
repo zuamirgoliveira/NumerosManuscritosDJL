@@ -6,6 +6,7 @@ import ai.djl.modality.cv.util.NDImageUtils;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.Shape;
 import ai.djl.training.dataset.Record;
 import ai.djl.training.dataset.RandomAccessDataset;
 import ai.djl.util.Progress;
@@ -41,6 +42,11 @@ import java.util.Locale;
  * decodificada do disco quando {@link #get} é chamado para aquele índice —
  * normalmente uma vez por época, por imagem, durante o treino.
  *
+ * <p>Opcionalmente ({@code setCacheInMemory(true)}), {@link #prepare} também
+ * decodifica TODAS as imagens uma única vez e as guarda na memória como bytes
+ * (o MNIST inteiro ocupa cerca de 55 MB). As épocas seguintes deixam de tocar o
+ * disco e de decodificar PNG, que era o gargalo do treino.
+ *
  * <p>Por herdar de {@link RandomAccessDataset}, ganha de graça o
  * embaralhamento e a divisão em lotes (batches) — basta chamar
  * {@code setSampling(batchSize, shuffle)} no builder.
@@ -55,12 +61,20 @@ public final class ImageFolderDataset extends RandomAccessDataset {
     private final List<Path> imagePaths = new ArrayList<>();
     private final List<Integer> imageLabels = new ArrayList<>();
 
+    /** Se verdadeiro, as imagens são decodificadas uma vez em {@link #prepare} e guardadas aqui. */
+    private final boolean cacheInMemory;
+
+    /** Pixels (uint8) e formato (altura, largura, canais) de cada imagem; só usado com cache. */
+    private final List<byte[]> cachedPixels = new ArrayList<>();
+    private final List<Shape> cachedShapes = new ArrayList<>();
+
     /** Evita indexar as pastas duas vezes se prepare() for chamado de novo. */
     private boolean prepared;
 
     private ImageFolderDataset(Builder builder) {
         super(builder);
         this.root = builder.root;
+        this.cacheInMemory = builder.cacheInMemory;
     }
 
     public static Builder builder() {
@@ -109,12 +123,39 @@ public final class ImageFolderDataset extends RandomAccessDataset {
             }
         }
 
+        if (cacheInMemory) {
+            decodeAllImages();
+        }
+
         prepared = true;
 
         if (progress != null) {
             progress.reset("Indexando imagens em " + root, imagePaths.size());
             progress.end();
         }
+    }
+
+    /**
+     * Decodifica todas as imagens (em paralelo) para escala de cinza e guarda os
+     * bytes na memória. Usa a mesma conversão do caminho sem cache
+     * ({@code toNDArray(GRAYSCALE)}), então o resultado final é idêntico.
+     */
+    private void decodeAllImages() {
+        int n = imagePaths.size();
+        byte[][] pixels = new byte[n][];
+        Shape[] shapes = new Shape[n];
+        java.util.stream.IntStream.range(0, n).parallel().forEach(i -> {
+            try (NDManager temp = NDManager.newBaseManager()) {
+                Image image = ImageFactory.getInstance().fromFile(imagePaths.get(i));
+                NDArray array = image.toNDArray(temp, Image.Flag.GRAYSCALE);
+                pixels[i] = array.toByteArray();
+                shapes[i] = array.getShape();
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+        cachedPixels.addAll(Arrays.asList(pixels));
+        cachedShapes.addAll(Arrays.asList(shapes));
     }
 
     /**
@@ -125,14 +166,21 @@ public final class ImageFolderDataset extends RandomAccessDataset {
     public Record get(NDManager manager, long index) throws IOException {
         int i = Math.toIntExact(index);
 
-        // Lê o arquivo PNG do disco (só neste momento — carregamento preguiçoso).
-        Image image = ImageFactory.getInstance().fromFile(imagePaths.get(i));
+        NDArray array;
+        if (cacheInMemory) {
+            // Bytes já decodificados em prepare(): só cria o tensor uint8.
+            array = manager.create(java.nio.ByteBuffer.wrap(cachedPixels.get(i)),
+                    cachedShapes.get(i), ai.djl.ndarray.types.DataType.UINT8);
+        } else {
+            // Lê o arquivo PNG do disco (só neste momento — carregamento preguiçoso).
+            Image image = ImageFactory.getInstance().fromFile(imagePaths.get(i));
+            array = image.toNDArray(manager, Image.Flag.GRAYSCALE);
+        }
 
         // Converte para escala de cinza (1 canal) e depois para um tensor
         // float com valores entre 0 e 1 (formato: canal, altura, largura) — o
         // mesmo tratamento aplicado na inferência por DigitClassifier,
         // garantindo consistência entre treino e inferência.
-        NDArray array = image.toNDArray(manager, Image.Flag.GRAYSCALE);
         NDArray data = NDImageUtils.toTensor(array);
 
         // O rótulo é um escalar com o número do dígito (0 a 9).
@@ -156,10 +204,17 @@ public final class ImageFolderDataset extends RandomAccessDataset {
     public static final class Builder extends BaseBuilder<Builder> {
 
         Path root;
+        boolean cacheInMemory;
 
         /** Define a pasta raiz (ex.: "images-training") a ser lida. */
         public Builder setRoot(Path root) {
             this.root = root;
+            return this;
+        }
+
+        /** Se verdadeiro, decodifica todas as imagens uma vez e as mantém na memória. */
+        public Builder setCacheInMemory(boolean cacheInMemory) {
+            this.cacheInMemory = cacheInMemory;
             return this;
         }
 

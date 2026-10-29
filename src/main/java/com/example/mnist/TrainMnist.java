@@ -1,6 +1,8 @@
 package com.example.mnist;
 
+import ai.djl.Device;
 import ai.djl.Model;
+import ai.djl.engine.Engine;
 import ai.djl.metric.Metrics;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.training.DefaultTrainingConfig;
@@ -17,9 +19,12 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 
 /**
- * Treina uma rede neural simples (MLP) para reconhecer dígitos manuscritos.
+ * Treina uma rede neural (MLP ou CNN, ver {@link DigitClassifier.Architecture}) para reconhecer dígitos manuscritos.
  *
  * <p>Este exemplo NÃO usa o módulo {@code ai.djl:basicdataset} (e a classe
  * pronta Mnist). Em vez disso, lê as imagens diretamente das pastas
@@ -34,15 +39,39 @@ import java.nio.file.Paths;
  */
 public final class TrainMnist {
 
-    /** Quantas imagens são processadas juntas a cada passo de atualização dos pesos. */
-    private static final int BATCH_SIZE = 32;
+    /** Tamanho de lote padrão: quantas imagens são processadas juntas a cada atualização dos pesos. */
+    private static final int DEFAULT_BATCH_SIZE = 32;
 
-    /** Quantas vezes o conjunto de treino completo é percorrido. */
-    private static final int EPOCHS = 5;
+    /** Número de épocas padrão: quantas vezes o conjunto de treino completo é percorrido. */
+    private static final int DEFAULT_EPOCHS = 5;
+
+    /** Semente padrão: fixa a inicialização dos pesos e o embaralhamento, para o treino ser reproduzível. */
+    private static final int DEFAULT_SEED = 42;
+
+    /** Arquivo onde cada execução acrescenta uma linha com configuração e resultados. */
+    private static final Path RESULTS_FILE = Paths.get("results/treinos.csv");
 
     private TrainMnist() {}
 
     public static void main(String[] args) throws IOException, TranslateException {
+        // Uso: TrainMnist [tamanhoDoLote] [épocas]. Sem argumentos, usa os padrões.
+        int batchSize = args.length > 0 ? Integer.parseInt(args[0]) : DEFAULT_BATCH_SIZE;
+        int epochs = args.length > 1 ? Integer.parseInt(args[1]) : DEFAULT_EPOCHS;
+
+        // Opções por propriedade do sistema (-D...): semente e rótulo do experimento,
+        // este último só identifica a linha no CSV de resultados (ex.: "baseline-mlp").
+        int seed = Integer.getInteger("treino.seed", DEFAULT_SEED);
+        String label = System.getProperty("treino.rotulo", "sem-rotulo");
+
+        // Otimizações de carregamento de dados (desligadas por padrão):
+        // -Dtreino.cache=true  decodifica os PNGs uma vez e os mantém na memória;
+        // -Dtreino.threads=N   monta os lotes em N threads, em paralelo ao treino.
+        boolean cache = Boolean.getBoolean("treino.cache");
+        int threads = Integer.getInteger("treino.threads", 0);
+
+        // A semente precisa ser definida ANTES de criar modelo e datasets.
+        Engine.getInstance().setRandomSeed(seed);
+
         // Garante que a pasta de saída do modelo exista.
         Path modelDir = DigitClassifier.DEFAULT_MODEL_DIR;
         Files.createDirectories(modelDir);
@@ -56,7 +85,9 @@ public final class TrainMnist {
         // rede não "decore" a ordem das imagens.
         ImageFolderDataset trainingSet = ImageFolderDataset.builder()
                 .setRoot(Paths.get("images-training"))
-                .setSampling(BATCH_SIZE, true)
+                .setSampling(batchSize, true)
+                .setCacheInMemory(cache)
+                .optPrefetchNumber(Math.max(2, threads))
                 .build();
         trainingSet.prepare(new ProgressBar());
 
@@ -64,15 +95,19 @@ public final class TrainMnist {
         // a acurácia real. Não precisa embaralhar (shuffle = false).
         ImageFolderDataset validationSet = ImageFolderDataset.builder()
                 .setRoot(Paths.get("images-validation"))
-                .setSampling(BATCH_SIZE, false)
+                .setSampling(batchSize, false)
+                .setCacheInMemory(cache)
+                .optPrefetchNumber(Math.max(2, threads))
                 .build();
         validationSet.prepare(new ProgressBar());
 
         // 2) ARQUITETURA DO MODELO
-        // A estrutura (MLP 784 -> 128 -> 64 -> 10) é definida em
-        // DigitClassifier.newBlock(), compartilhada com a inferência.
-        Model model = Model.newInstance(DigitClassifier.MODEL_NAME);
-        model.setBlock(DigitClassifier.newBlock());
+        // A estrutura é definida em DigitClassifier.Architecture.newBlock(),
+        // compartilhada com a inferência. Escolha com -Dmodelo.arquitetura=mlp|cnn
+        // (padrão: mlp). Cada arquitetura salva em arquivo próprio.
+        DigitClassifier.Architecture architecture = DigitClassifier.Architecture.fromProperty();
+        Model model = Model.newInstance(architecture.modelName());
+        model.setBlock(architecture.newBlock());
 
         // 3) CONFIGURAÇÃO DO TREINO
         // - Loss (perda): softmaxCrossEntropyLoss, a escolha padrão para
@@ -84,6 +119,35 @@ public final class TrainMnist {
                 .addEvaluator(new Accuracy())
                 .addTrainingListeners(TrainingListener.Defaults.logging());
 
+        // Threads daemon: se o pool ficasse "vivo", o programa nunca terminaria.
+        if (threads > 0) {
+            config.optExecutorService(java.util.concurrent.Executors.newFixedThreadPool(threads, runnable -> {
+                Thread thread = new Thread(runnable, "carregamento-dados");
+                thread.setDaemon(true);
+                return thread;
+            }));
+        }
+
+        // Device: por padrão o DJL decide sozinho (todas as GPUs detectadas ou CPU).
+        // -Dtreino.device=gpu força a GPU 0 mesmo quando o DJL não a detecta
+        // (acontece sem o CUDA Toolkit instalado); -Dtreino.device=cpu força a CPU.
+        String deviceOption = System.getProperty("treino.device", "auto");
+        if (deviceOption.equals("gpu")) {
+            config.optDevices(new Device[] {Device.gpu(0)});
+        } else if (deviceOption.equals("cpu")) {
+            config.optDevices(new Device[] {Device.cpu()});
+        }
+
+        // Informa onde o treino vai rodar. O DJL usa todas as GPUs visíveis e,
+        // se não houver nenhuma, a CPU. Para forçar CPU: CUDA_VISIBLE_DEVICES="".
+        Device[] devices = config.getDevices();
+        System.out.println("Engine: " + Engine.getInstance().getEngineName()
+                + " " + Engine.getInstance().getVersion());
+        System.out.println("GPUs disponíveis: " + Engine.getInstance().getGpuCount());
+        System.out.println("Treinando em: " + java.util.Arrays.toString(devices)
+                + " | lote=" + batchSize + " | épocas=" + epochs + " | semente=" + seed
+                + " | cache=" + cache + " | threads=" + threads);
+
         // 4) TREINAMENTO
         // O Trainer guarda recursos nativos, por isso é aberto em
         // try-with-resources (fechado automaticamente ao final).
@@ -92,26 +156,59 @@ public final class TrainMnist {
             // Informa o formato de UMA entrada para o Trainer alocar os pesos:
             // (lote, canal, altura, largura) = (1, 1, 28, 28). Cada amostra do
             // ImageFolderDataset tem formato (1, 28, 28) — canal, altura,
-            // largura — e o Mlp achata isso para 784 valores internamente.
+            // largura — e o Mlp achata isso para 784 valores; a CNN usa o formato como está.
             trainer.initialize(new Shape(1, 1, DigitClassifier.IMAGE_HEIGHT, DigitClassifier.IMAGE_WIDTH));
 
             trainer.setMetrics(new Metrics());
 
             // Loop de treino: para cada época, percorre os lotes do conjunto
             // de treino (ajustando os pesos) e depois avalia no de validação.
-            EasyTrain.fit(trainer, EPOCHS, trainingSet, validationSet);
+            long start = System.nanoTime();
+            EasyTrain.fit(trainer, epochs, trainingSet, validationSet);
+            double seconds = (System.nanoTime() - start) / 1e9;
 
             TrainingResult result = trainer.getTrainingResult();
             System.out.println("Acurácia final de validação: "
                     + result.getValidateEvaluation("Accuracy"));
+
+            // Resumo de desempenho (as imagens de validação também são processadas a cada época).
+            long images = trainingSet.size() * (long) epochs;
+            System.out.printf("=== DESEMPENHO === device=%s lote=%d épocas=%d%n",
+                    devices[0], batchSize, epochs);
+            System.out.printf("Tempo total de fit: %.1f s | por época: %.1f s | %.0f imagens/s (treino)%n",
+                    seconds, seconds / epochs, images / seconds);
+
+            appendResult(label, architecture, devices[0], batchSize, epochs, seed, cache, threads, result, seconds, images / seconds);
         }
 
         // 5) SALVAR O MODELO
-        // Grava os pesos em build/mnist-model/mnist-mlp-0005.params (o 0005
+        // Grava os pesos em build/mnist-model/<modelo>-0005.params (o 0005
         // indica a época). É esse arquivo que DigitClassifier carrega depois.
-        model.save(modelDir, DigitClassifier.MODEL_NAME);
+        model.save(modelDir, architecture.modelName());
         System.out.println("Modelo salvo em: " + modelDir.toAbsolutePath());
 
         model.close();
+    }
+
+    /**
+     * Acrescenta uma linha ao CSV de resultados ({@link #RESULTS_FILE}), criando o
+     * arquivo com cabeçalho na primeira vez. Permite comparar execuções depois.
+     */
+    private static void appendResult(String label, DigitClassifier.Architecture architecture, Device device, int batchSize, int epochs,
+            int seed, boolean cache, int threads, TrainingResult result, double seconds, double imagesPerSecond)
+            throws IOException {
+        Files.createDirectories(RESULTS_FILE.getParent());
+        if (Files.notExists(RESULTS_FILE)) {
+            Files.writeString(RESULTS_FILE, "data_hora,rotulo,arquitetura,device,lote,epocas,semente,cache,threads,"
+                    + "acc_treino,acc_validacao,perda_treino,perda_validacao,"
+                    + "tempo_total_s,tempo_epoca_s,imagens_por_s\n");
+        }
+        String line = String.format(java.util.Locale.ROOT,
+                "%s,%s,%s,%s,%d,%d,%d,%s,%d,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%.0f%n",
+                LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS), label, architecture, device, batchSize,
+                epochs, seed, cache, threads, result.getTrainEvaluation("Accuracy"),
+                result.getValidateEvaluation("Accuracy"), result.getTrainLoss(),
+                result.getValidateLoss(), seconds, seconds / epochs, imagesPerSecond);
+        Files.writeString(RESULTS_FILE, line, StandardOpenOption.APPEND);
     }
 }
