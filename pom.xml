@@ -55,6 +55,38 @@
                 <javafx.platform>linux</javafx.platform>
             </properties>
         </profile>
+
+        <!--
+            Perfil "gpu": mvn exec:java -Pgpu -Dexec.mainClass=...
+            O DJL 0.36 não detecta a GPU sem o CUDA Toolkit instalado e baixaria
+            o PyTorch só-CPU. Este perfil pede o build CUDA 12.8 (o primeiro com
+            suporte às GPUs Blackwell, como a RTX 50xx) e força a GPU 0, sem
+            precisar exportar variáveis de ambiente à mão. Se a sua GPU usa outro
+            CUDA, ajuste o valor de PYTORCH_FLAVOR (ex.: cu126, cu121).
+        -->
+        <profile>
+            <id>gpu</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <configuration>
+                            <systemProperties>
+                                <systemProperty>
+                                    <key>PYTORCH_FLAVOR</key>
+                                    <value>cu128</value>
+                                </systemProperty>
+                                <systemProperty>
+                                    <key>treino.device</key>
+                                    <value>gpu</value>
+                                </systemProperty>
+                            </systemProperties>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
     </profiles>
 
     <!--
@@ -73,6 +105,7 @@
                 <scope>import</scope>
             </dependency>
         </dependencies>
+
     </dependencyManagement>
 
     <dependencies>
@@ -132,6 +165,13 @@
             <version>${javafx.version}</version>
             <classifier>${javafx.platform}</classifier>
         </dependency>
+        <!-- Testes automatizados (mvn test) -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.3</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -143,6 +183,13 @@
                 <configuration>
                     <release>21</release>
                 </configuration>
+            </plugin>
+
+            <!-- Executa os testes JUnit 5 em src/test/java (mvn test) -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.6</version>
             </plugin>
 
             <!-- Permite rodar as classes com "mvn exec:java -Dexec.mainClass=..." -->

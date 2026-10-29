@@ -11,7 +11,7 @@ Projeto didático de Deep Learning em Java: reconhecimento de dígitos manuscrit
 - JavaFX 21.0.2 (`controls`, `graphics`, `base`) com classifier por SO
 - `slf4j-simple` 2.0.13 para logging
 - Idioma: **todo o código, comentários, Javadoc e mensagens ao usuário estão em português (pt-BR)**. Mantenha.
-- Não há testes automatizados (`src/test` não existe).
+- Testes JUnit 5 em `src/test/java` (`mvn test`, 13 testes: dataset, arquiteturas, classificador, avaliação em lote). Rodam na raiz do projeto e usam os modelos versionados em `build/mnist-model`.
 
 Pipeline: `PrepareTrainingImages` → `TrainMnist` → `InferMnist` (CLI) ou `ui.InferenceApp` (JavaFX).
 
@@ -27,7 +27,8 @@ src/main/java/com/example/mnist/
   ImageFolderDataset.java            Dataset DJL customizado ("uma pasta por classe")
   PrepareTrainingImages.java         baixa MNIST (IDX) e grava PNGs     [main]
   TrainMnist.java                    treina e salva o modelo            [main]
-  InferMnist.java                    inferência por CLI                 [main]
+  InferMnist.java                    inferência por CLI (1 imagem)      [main]
+  EvaluateMnist.java                 avaliação em lote de uma pasta     [main]
   ui/Launcher.java                   Main-Class do fat JAR (delega ao app)
   ui/InferenceApp.java               GUI JavaFX                         [main via Launcher]
 ```
@@ -43,6 +44,8 @@ mvn clean compile
 mvn exec:java -Dexec.mainClass="com.example.mnist.PrepareTrainingImages"   # uma vez; precisa de internet
 mvn exec:java -Dexec.mainClass="com.example.mnist.TrainMnist" -Dexec.args="32 5"   # [lote] [épocas]
 mvn exec:java -Dexec.mainClass="com.example.mnist.InferMnist" -Dexec.args="images-validation/7/00064.png"
+mvn exec:java -Dexec.mainClass="com.example.mnist.EvaluateMnist" [-Dexec.args="outra/pasta"]   # acurácia, por dígito e matriz de confusão
+mvn test
 mvn clean package && java -jar target/djl-mnist-example-1.0.0.jar          # GUI
 ```
 
@@ -59,7 +62,7 @@ mvn clean package && java -jar target/djl-mnist-example-1.0.0.jar          # GUI
 | `-Dtreino.threads=N` | Monta os lotes em N threads daemon | 0 (mesma thread) |
 | `-Dtreino.rotulo=nome` | Nome da linha em `results/treinos.csv` | `sem-rotulo` |
 
-**GPU:** o DJL 0.36 não detecta a GPU sem o CUDA Toolkit (`GPUs disponíveis: 0`) e baixa o PyTorch só-CPU. Neste ambiente (RTX 5050, Blackwell) é preciso `PYTORCH_FLAVOR=cu128` **e** `-Dtreino.device=gpu`.
+**GPU:** o DJL 0.36 não detecta a GPU sem o CUDA Toolkit (`GPUs disponíveis: 0`) e baixa o PyTorch só-CPU. Use o perfil Maven **`-Pgpu`** (`mvn exec:java -Pgpu ...`), que define `PYTORCH_FLAVOR=cu128` e `treino.device=gpu` (RTX 5050, Blackwell). Para outra GPU, ajuste o flavor no perfil `gpu` do `pom.xml`. Atenção: uma variável de ambiente `PYTORCH_FLAVOR` (mesmo vazia) tem prioridade sobre a propriedade do perfil.
 
 ## Componentes e regras de negócio
 
@@ -94,7 +97,10 @@ mvn clean package && java -jar target/djl-mnist-example-1.0.0.jar          # GUI
 - Sem `optExecutorService`, o DJL monta os lotes na thread do treino; com `treino.threads` usa um pool **daemon** (um pool não-daemon impede o programa de terminar).
 - Imprime engine, GPUs, device, tempo por época e imagens/s; salva em `<modelName>-0005.params`; acrescenta uma linha a `results/treinos.csv` (data, rótulo, arquitetura, device, lote, épocas, semente, cache, threads, acurácias, perdas, tempos).
 - Reprodutibilidade: MLP (GPU) e CNN (CPU) repetem o resultado com a mesma semente; **CNN na GPU varia ~0,1–0,2 ponto** (não determinismo do cuDNN).
-- Nota: `model` não está em try-with-resources (vaza se houver exceção).
+- O `Model` é aberto em try-with-resources (fechado mesmo se o treino falhar).
+
+### `EvaluateMnist`
+Avalia o modelo sobre uma pasta inteira (padrão `images-validation`, mesmo formato "subpasta numérica por classe"): imprime acurácia geral, por dígito e a matriz de confusão (linha = real, coluna = previsto). Arquitetura por `-Dmodelo.arquitetura`. Pastas de classe ausentes são ignoradas. A GUI continua classificando uma imagem por vez.
 
 ### `InferMnist`
 CLI mínima. Sem argumento imprime o uso e retorna (sem erro). Com argumento imprime as probabilidades e `>>> Dígito reconhecido: X (confiança YY.YY%)`.
@@ -112,6 +118,8 @@ CLI mínima. Sem argumento imprime o uso e retorna (sem erro). Com argumento imp
 
 - `maven.compiler.release=21`, UTF-8. Propriedade `app.mainClass=com.example.mnist.ui.Launcher`.
 - Profiles `windows`/`mac`/`linux` (ativação por SO) definem `javafx.platform` (`win`/`mac`/`linux`; padrão `linux`) usada como `classifier` das dependências JavaFX → **o fat JAR só roda no SO em que foi gerado**.
+- Profile `gpu` (ativado só com `-Pgpu`): configura o `exec-maven-plugin` com as propriedades de GPU.
+- `junit-jupiter` 5.10.3 (test) e `maven-surefire-plugin` 3.5.6 para `mvn test`.
 - `maven-shade-plugin` 3.5.1 na fase `package`, com `ServicesResourceTransformer` (necessário para o DJL achar o engine PyTorch) e `ManifestResourceTransformer`. Gera `dependency-reduced-pom.xml`.
 - `exec-maven-plugin` 3.3.0 para rodar as classes `main`.
 - Binários nativos do PyTorch são baixados pelo DJL na primeira execução (precisa de internet).

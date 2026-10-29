@@ -106,88 +106,88 @@ public final class TrainMnist {
         // compartilhada com a inferência. Escolha com -Dmodelo.arquitetura=mlp|cnn
         // (padrão: mlp). Cada arquitetura salva em arquivo próprio.
         DigitClassifier.Architecture architecture = DigitClassifier.Architecture.fromProperty();
-        Model model = Model.newInstance(architecture.modelName());
-        model.setBlock(architecture.newBlock());
+        // O Model guarda memória nativa: try-with-resources o fecha mesmo se o treino falhar.
+        try (Model model = Model.newInstance(architecture.modelName())) {
+            model.setBlock(architecture.newBlock());
 
-        // 3) CONFIGURAÇÃO DO TREINO
-        // - Loss (perda): softmaxCrossEntropyLoss, a escolha padrão para
-        //   classificação com várias classes. Mede o quão "errada" está a
-        //   previsão; o treino tenta minimizar esse valor.
-        // - Accuracy: métrica de acompanhamento (% de acertos).
-        // - Logging: imprime o progresso de cada época no console.
-        DefaultTrainingConfig config = new DefaultTrainingConfig(Loss.softmaxCrossEntropyLoss())
-                .addEvaluator(new Accuracy())
-                .addTrainingListeners(TrainingListener.Defaults.logging());
+            // 3) CONFIGURAÇÃO DO TREINO
+            // - Loss (perda): softmaxCrossEntropyLoss, a escolha padrão para
+            //   classificação com várias classes. Mede o quão "errada" está a
+            //   previsão; o treino tenta minimizar esse valor.
+            // - Accuracy: métrica de acompanhamento (% de acertos).
+            // - Logging: imprime o progresso de cada época no console.
+            DefaultTrainingConfig config = new DefaultTrainingConfig(Loss.softmaxCrossEntropyLoss())
+                    .addEvaluator(new Accuracy())
+                    .addTrainingListeners(TrainingListener.Defaults.logging());
 
-        // Threads daemon: se o pool ficasse "vivo", o programa nunca terminaria.
-        if (threads > 0) {
-            config.optExecutorService(java.util.concurrent.Executors.newFixedThreadPool(threads, runnable -> {
-                Thread thread = new Thread(runnable, "carregamento-dados");
-                thread.setDaemon(true);
-                return thread;
-            }));
+            // Threads daemon: se o pool ficasse "vivo", o programa nunca terminaria.
+            if (threads > 0) {
+                config.optExecutorService(java.util.concurrent.Executors.newFixedThreadPool(threads, runnable -> {
+                    Thread thread = new Thread(runnable, "carregamento-dados");
+                    thread.setDaemon(true);
+                    return thread;
+                }));
+            }
+
+            // Device: por padrão o DJL decide sozinho (todas as GPUs detectadas ou CPU).
+            // -Dtreino.device=gpu força a GPU 0 mesmo quando o DJL não a detecta
+            // (acontece sem o CUDA Toolkit instalado); -Dtreino.device=cpu força a CPU.
+            String deviceOption = System.getProperty("treino.device", "auto");
+            if (deviceOption.equals("gpu")) {
+                config.optDevices(new Device[] {Device.gpu(0)});
+            } else if (deviceOption.equals("cpu")) {
+                config.optDevices(new Device[] {Device.cpu()});
+            }
+
+            // Informa onde o treino vai rodar. O DJL usa todas as GPUs visíveis e,
+            // se não houver nenhuma, a CPU. Para forçar CPU: CUDA_VISIBLE_DEVICES="".
+            Device[] devices = config.getDevices();
+            System.out.println("Engine: " + Engine.getInstance().getEngineName()
+                    + " " + Engine.getInstance().getVersion());
+            System.out.println("GPUs disponíveis: " + Engine.getInstance().getGpuCount());
+            System.out.println("Treinando em: " + java.util.Arrays.toString(devices)
+                    + " | lote=" + batchSize + " | épocas=" + epochs + " | semente=" + seed
+                    + " | cache=" + cache + " | threads=" + threads);
+
+            // 4) TREINAMENTO
+            // O Trainer guarda recursos nativos, por isso é aberto em
+            // try-with-resources (fechado automaticamente ao final).
+            try (Trainer trainer = model.newTrainer(config)) {
+
+                // Informa o formato de UMA entrada para o Trainer alocar os pesos:
+                // (lote, canal, altura, largura) = (1, 1, 28, 28). Cada amostra do
+                // ImageFolderDataset tem formato (1, 28, 28) — canal, altura,
+                // largura — e o Mlp achata isso para 784 valores; a CNN usa o formato como está.
+                trainer.initialize(new Shape(1, 1, DigitClassifier.IMAGE_HEIGHT, DigitClassifier.IMAGE_WIDTH));
+
+                trainer.setMetrics(new Metrics());
+
+                // Loop de treino: para cada época, percorre os lotes do conjunto
+                // de treino (ajustando os pesos) e depois avalia no de validação.
+                long start = System.nanoTime();
+                EasyTrain.fit(trainer, epochs, trainingSet, validationSet);
+                double seconds = (System.nanoTime() - start) / 1e9;
+
+                TrainingResult result = trainer.getTrainingResult();
+                System.out.println("Acurácia final de validação: "
+                        + result.getValidateEvaluation("Accuracy"));
+
+                // Resumo de desempenho (as imagens de validação também são processadas a cada época).
+                long images = trainingSet.size() * (long) epochs;
+                System.out.printf("=== DESEMPENHO === device=%s lote=%d épocas=%d%n",
+                        devices[0], batchSize, epochs);
+                System.out.printf("Tempo total de fit: %.1f s | por época: %.1f s | %.0f imagens/s (treino)%n",
+                        seconds, seconds / epochs, images / seconds);
+
+                appendResult(label, architecture, devices[0], batchSize, epochs, seed, cache, threads, result, seconds, images / seconds);
+            }
+
+            // 5) SALVAR O MODELO
+            // Grava os pesos em build/mnist-model/<modelo>-0005.params (o 0005
+            // indica a época). É esse arquivo que DigitClassifier carrega depois.
+            model.save(modelDir, architecture.modelName());
+            System.out.println("Modelo salvo em: " + modelDir.toAbsolutePath());
         }
-
-        // Device: por padrão o DJL decide sozinho (todas as GPUs detectadas ou CPU).
-        // -Dtreino.device=gpu força a GPU 0 mesmo quando o DJL não a detecta
-        // (acontece sem o CUDA Toolkit instalado); -Dtreino.device=cpu força a CPU.
-        String deviceOption = System.getProperty("treino.device", "auto");
-        if (deviceOption.equals("gpu")) {
-            config.optDevices(new Device[] {Device.gpu(0)});
-        } else if (deviceOption.equals("cpu")) {
-            config.optDevices(new Device[] {Device.cpu()});
-        }
-
-        // Informa onde o treino vai rodar. O DJL usa todas as GPUs visíveis e,
-        // se não houver nenhuma, a CPU. Para forçar CPU: CUDA_VISIBLE_DEVICES="".
-        Device[] devices = config.getDevices();
-        System.out.println("Engine: " + Engine.getInstance().getEngineName()
-                + " " + Engine.getInstance().getVersion());
-        System.out.println("GPUs disponíveis: " + Engine.getInstance().getGpuCount());
-        System.out.println("Treinando em: " + java.util.Arrays.toString(devices)
-                + " | lote=" + batchSize + " | épocas=" + epochs + " | semente=" + seed
-                + " | cache=" + cache + " | threads=" + threads);
-
-        // 4) TREINAMENTO
-        // O Trainer guarda recursos nativos, por isso é aberto em
-        // try-with-resources (fechado automaticamente ao final).
-        try (Trainer trainer = model.newTrainer(config)) {
-
-            // Informa o formato de UMA entrada para o Trainer alocar os pesos:
-            // (lote, canal, altura, largura) = (1, 1, 28, 28). Cada amostra do
-            // ImageFolderDataset tem formato (1, 28, 28) — canal, altura,
-            // largura — e o Mlp achata isso para 784 valores; a CNN usa o formato como está.
-            trainer.initialize(new Shape(1, 1, DigitClassifier.IMAGE_HEIGHT, DigitClassifier.IMAGE_WIDTH));
-
-            trainer.setMetrics(new Metrics());
-
-            // Loop de treino: para cada época, percorre os lotes do conjunto
-            // de treino (ajustando os pesos) e depois avalia no de validação.
-            long start = System.nanoTime();
-            EasyTrain.fit(trainer, epochs, trainingSet, validationSet);
-            double seconds = (System.nanoTime() - start) / 1e9;
-
-            TrainingResult result = trainer.getTrainingResult();
-            System.out.println("Acurácia final de validação: "
-                    + result.getValidateEvaluation("Accuracy"));
-
-            // Resumo de desempenho (as imagens de validação também são processadas a cada época).
-            long images = trainingSet.size() * (long) epochs;
-            System.out.printf("=== DESEMPENHO === device=%s lote=%d épocas=%d%n",
-                    devices[0], batchSize, epochs);
-            System.out.printf("Tempo total de fit: %.1f s | por época: %.1f s | %.0f imagens/s (treino)%n",
-                    seconds, seconds / epochs, images / seconds);
-
-            appendResult(label, architecture, devices[0], batchSize, epochs, seed, cache, threads, result, seconds, images / seconds);
-        }
-
-        // 5) SALVAR O MODELO
-        // Grava os pesos em build/mnist-model/<modelo>-0005.params (o 0005
-        // indica a época). É esse arquivo que DigitClassifier carrega depois.
-        model.save(modelDir, architecture.modelName());
-        System.out.println("Modelo salvo em: " + modelDir.toAbsolutePath());
-
-        model.close();
     }
 
     /**
